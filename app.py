@@ -530,4 +530,4 @@ st.markdown("""
 ### วิธีรัน
 ```bash
 pip install streamlit ultralytics opencv-python pandas
-streamlit run app.py
+streamlit run app.py""")
