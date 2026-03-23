@@ -33,6 +33,7 @@ st.markdown("""
 .alert-safe { background: rgba(22,163,74,0.10); color: #bbf7d0; }
 .alert-warn { background: rgba(245,158,11,0.10); color: #fde68a; }
 .alert-risk { background: rgba(239,68,68,0.10); color: #fecaca; }
+.info-box { border-radius: 14px; padding: 12px 14px; background: rgba(59,130,246,0.10); border: 1px solid rgba(59,130,246,0.30); color: #dbeafe; margin-bottom: 14px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,11 +43,17 @@ def file_exists(path_str: str) -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def load_model(model_path: str):
-    return YOLO(model_path)
+def load_model_safe(model_path: str):
+    try:
+        model = YOLO(model_path)
+        return model, None
+    except Exception as e:
+        return None, str(e)
 
 
 def safe_model_names(model) -> dict:
+    if model is None:
+        return {}
     names = getattr(model, "names", {})
     if isinstance(names, list):
         return {i: n for i, n in enumerate(names)}
@@ -256,10 +263,19 @@ notify_token = st.sidebar.text_input("LINE Notify token / Messaging token", valu
 analyze_btn = st.sidebar.button("🔍 Analyze Factory", use_container_width=True)
 
 st.markdown('<div class="main-title">SmartSafe Factory 4-Line Dashboard</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Grid layout แบบโรงงานจริง, AI แจ้งเตือนเฉพาะไลน์ที่เสี่ยง, LINE alert preview, และกราฟเปรียบเทียบทั้ง 4 ไลน์</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-title">Fallback mode: ถ้ายังไม่มี best.pt แอปก็ยังเปิดได้ และใช้ detect คนก่อน</div>', unsafe_allow_html=True)
 
-if not file_exists(helmet_model_path):
-    st.warning("ยังไม่พบไฟล์โมเดลหมวกจริง เช่น best.pt กรุณาวางไฟล์ไว้ในโฟลเดอร์เดียวกับ app.py หรือใส่ path ให้ถูก")
+person_model, person_model_error = load_model_safe(DEFAULT_PERSON_MODEL)
+helmet_model, helmet_model_error = load_model_safe(helmet_model_path) if file_exists(helmet_model_path) else (None, "Helmet model file not found")
+
+if person_model_error:
+    st.error(f"โหลด person model ไม่ได้: {person_model_error}")
+
+if helmet_model_error:
+    st.markdown(
+        f'<div class="info-box">ตอนนี้ยังใช้ <b>helmet fallback mode</b> อยู่ เพราะโหลดโมเดลหมวกไม่ได้<br><br>สาเหตุ: {helmet_model_error}</div>',
+        unsafe_allow_html=True
+    )
 
 image_path = None
 if image_source == "Upload image":
@@ -273,14 +289,11 @@ else:
     else:
         st.info("กรุณาใส่ sample image path ให้ถูกต้อง")
 
-person_model = load_model(DEFAULT_PERSON_MODEL)
-helmet_model = load_model(helmet_model_path) if file_exists(helmet_model_path) else None
-
 if analyze_btn:
-    if not image_path:
+    if person_model is None:
+        st.error("ยังไม่สามารถโหลด person model ได้")
+    elif not image_path:
         st.error("ยังไม่มีรูปภาพสำหรับวิเคราะห์")
-    elif helmet_model is None:
-        st.error("ยังไม่มีไฟล์โมเดลหมวกจริง")
     else:
         frame = cv2.imread(image_path)
         if frame is None:
@@ -288,10 +301,7 @@ if analyze_btn:
         else:
             h, w = frame.shape[:2]
             person_res = person_model.predict(frame, conf=person_conf, verbose=False)[0]
-            helmet_res = helmet_model.predict(frame, conf=helmet_conf, verbose=False)[0]
-
             person_names = safe_model_names(person_model)
-            helmet_names = safe_model_names(helmet_model)
 
             person_boxes = []
             for box in person_res.boxes:
@@ -302,15 +312,20 @@ if analyze_btn:
 
             helmet_boxes = []
             no_helmet_boxes = []
-            for box in helmet_res.boxes:
-                cls_id = int(box.cls[0])
-                label = helmet_names.get(cls_id, str(cls_id))
-                kind = classify_helmet_label(label)
-                coords = tuple(map(int, box.xyxy[0].tolist()))
-                if kind == "helmet":
-                    helmet_boxes.append(coords)
-                elif kind == "no_helmet":
-                    no_helmet_boxes.append(coords)
+
+            if helmet_model is not None:
+                helmet_res = helmet_model.predict(frame, conf=helmet_conf, verbose=False)[0]
+                helmet_names = safe_model_names(helmet_model)
+
+                for box in helmet_res.boxes:
+                    cls_id = int(box.cls[0])
+                    label = helmet_names.get(cls_id, str(cls_id))
+                    kind = classify_helmet_label(label)
+                    coords = tuple(map(int, box.xyxy[0].tolist()))
+                    if kind == "helmet":
+                        helmet_boxes.append(coords)
+                    elif kind == "no_helmet":
+                        no_helmet_boxes.append(coords)
 
             annotated = frame.copy()
             add_line_overlay(annotated, w, h)
@@ -325,8 +340,13 @@ if analyze_btn:
             for person_box in person_boxes:
                 x1, y1, x2, y2 = person_box
                 zone = get_line_zone(person_box, w, h)
-                helmet_status, matched_box = associate_person_with_head_detection(person_box, helmet_boxes, no_helmet_boxes)
                 distance_cm = estimate_distance_cm(person_box, w, h)
+
+                if helmet_model is not None:
+                    helmet_status, matched_box = associate_person_with_head_detection(person_box, helmet_boxes, no_helmet_boxes)
+                else:
+                    helmet_status, matched_box = "unknown", None
+
                 risk, reasons = calculate_risk(helmet_status, distance_cm)
 
                 line_data[zone]["people"] += 1
@@ -350,7 +370,7 @@ if analyze_btn:
                     line_data[zone]["unknown"] += 1
                     total_unknown += 1
                     color = (0, 200, 255)
-                    label_text = f"{zone} | Unknown | {distance_cm} cm"
+                    label_text = f"{zone} | Person | {distance_cm} cm"
 
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(annotated, label_text, (x1, max(22, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
@@ -399,9 +419,9 @@ if analyze_btn:
                 with top3:
                     st.markdown('<div class="card">', unsafe_allow_html=True)
                     st.markdown('<div class="section-title">Model Info</div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="small-item">Helmet model: <b>{Path(helmet_model_path).name}</b></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="small-item">Person model: <b>{DEFAULT_PERSON_MODEL}</b></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="small-item">Helmet model: <b>{"Loaded" if helmet_model is not None else "Fallback mode"}</b></div>', unsafe_allow_html=True)
                     st.markdown(f'<div class="small-item">Person conf: <b>{person_conf}</b></div>', unsafe_allow_html=True)
-                    st.markdown(f'<div class="small-item">Helmet conf: <b>{helmet_conf}</b></div>', unsafe_allow_html=True)
                     st.markdown('</div>', unsafe_allow_html=True)
 
                 st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -441,13 +461,12 @@ if analyze_btn:
             with compare1:
                 compare_df = pd.DataFrame({
                     "Line": ["Line 1", "Line 2", "Line 3", "Line 4"],
-                    "Helmet": [line_data["Line 1"]["helmet"], line_data["Line 2"]["helmet"], line_data["Line 3"]["helmet"], line_data["Line 4"]["helmet"]],
-                    "No Helmet": [line_data["Line 1"]["no_helmet"], line_data["Line 2"]["no_helmet"], line_data["Line 3"]["no_helmet"], line_data["Line 4"]["no_helmet"]],
+                    "People": [line_data["Line 1"]["people"], line_data["Line 2"]["people"], line_data["Line 3"]["people"], line_data["Line 4"]["people"]],
                     "Unknown": [line_data["Line 1"]["unknown"], line_data["Line 2"]["unknown"], line_data["Line 3"]["unknown"], line_data["Line 4"]["unknown"]],
                 }).set_index("Line")
 
                 st.markdown('<div class="panel">', unsafe_allow_html=True)
-                st.markdown('<div class="section-title">Compare PPE Status Across 4 Lines</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">Compare People Across 4 Lines</div>', unsafe_allow_html=True)
                 st.bar_chart(compare_df, use_container_width=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -529,5 +548,5 @@ if analyze_btn:
 st.markdown("""
 ### วิธีรัน
 ```bash
-pip install streamlit ultralytics opencv-python pandas
-streamlit run app.py""")
+pip install -r requirements.txt
+streamlit run app.py
