@@ -1,0 +1,2 @@
+pip install streamlit ultralytics opencv-python pandas
+streamlit run app.py
